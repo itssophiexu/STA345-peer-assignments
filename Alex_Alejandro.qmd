@@ -1,0 +1,277 @@
+---
+title: "March Madness Bracket Generation"
+subtitle: "STA 345 — Student Assignment from Alex & Alejandro"
+author: "Sophie Xu"
+format: pdf
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Overview
+
+Each year, millions of fans fill out NCAA tournament brackets trying to predict all 63 game winners. Ludden et al. (2020) propose a mathematical approach: instead of crafting one "perfect" bracket, generate a large *pool* of random brackets using a probability model, hoping at least one scores well.
+
+In this assignment you'll explore the data behind their approach, run the simulation yourself, and tweak one parameter to see how it changes results.
+
+## Setup
+
+Load the shared project code and data. Make sure the `R/` and `data/` folders are in your working directory.
+
+```{r load}
+source("R/utils.R")
+source("R/models.R")
+source("R/generators.R")
+source("R/scoring.R")
+
+games <- read_csv("data/combined.csv") %>%
+  mutate(round = case_when(
+    round_of == 64 ~ 1, round_of == 32 ~ 2, round_of == 16 ~ 3,
+    round_of ==  8 ~ 4, round_of ==  4 ~ 5, round_of ==  2 ~ 6
+  ))
+
+# Helper: evaluate a generator by running N brackets x R replications
+evaluate_gen <- function(gen_fn, name, N, R, actual) {
+  all_scores <- numeric(N * R)
+  rep_maxes <- numeric(R)
+  for (rep in 1:R) {
+    offset <- (rep - 1) * N
+    best <- 0
+    for (i in 1:N) {
+      s <- score_bracket_fast(gen_fn(), actual)
+      all_scores[offset + i] <- s
+      if (s > best) best <- s
+    }
+    rep_maxes[rep] <- best
+  }
+  tibble(generator = name,
+         max_score_mean = mean(rep_maxes),
+         max_score_sd = sd(rep_maxes),
+         mean_score = mean(all_scores),
+         scores = list(all_scores))
+}
+```
+
+## Part 1: Understanding Upsets
+
+The foundation of any bracket model is knowing how often upsets happen.
+
+**Q1.** Run the code below. Which round has the highest upset rate? Why do you think that is?
+
+```{r q1}
+games %>%
+  mutate(upset = winning_team_seed > losing_team_seed) %>%
+  group_by(round) %>%
+  summarise(games = n(), upsets = sum(upset), upset_rate = round(mean(upset), 3))
+```
+
+*Your answer:*
+
+The fourth round has the highest upset rate. This makes sense because by this round, the most extreme seed matches are gone, such that the 15th/16th seeds are already eliminated. All the teams left are all good, possibly seeds 6/7, such that the chances of an upset is higher.
+
+**Q2.** Now look at Round 1 matchups specifically. Which seed pairing is closest to a coin flip? Why do you think that is?
+
+```{r q2}
+games %>%
+  filter(round == 1) %>%
+  mutate(s1 = pmin(winning_team_seed, losing_team_seed),
+         s2 = pmax(winning_team_seed, losing_team_seed),
+         s1_won = winning_team_seed == s1) %>%
+  group_by(matchup = paste0(s1, " vs ", s2)) %>%
+  summarise(games = n(), stronger_seed_wins = mean(s1_won)) %>%
+  arrange(stronger_seed_wins)
+```
+
+*Your answer:*
+
+The seed pairing that is closest to a coin flip is the 8 vs 9 seed, with the 8 seed win probability being 48%. This makes sense, since this seed difference is only 1, such that the skill difference between these two teams are minimal, and either team could win with almost identical chances.
+
+## Part 2: The Power Model's Key Idea
+
+The paper models win probability as a function of the two seeds. The key parameter is **α (alpha)**: higher α means the stronger seed is more dominant; α near 0 means it's basically a coin flip.
+
+```{r power-model}
+power_mod <- build_power_model(games, setdiff(1985:2023, 2020))
+```
+
+**Q3.** Look at the round-level alpha values below. The paper argues that α varies meaningfully across rounds, meaning upsets aren't equally likely everywhere. Based on these values, in which round are upsets most common? In which round do favorites dominate most? Why do you think this is?
+
+```{r q3}
+power_mod$round_alphas
+```
+
+*Your answer:*
+
+These alpha values match Part1, where the fourth round has the highest upset rate. The alpha value of 0.123 suggests that this match is nearly a coin flip, since the seed number doesn't matter as much, since every team has already beaten three teams. In Round 6, the alpha value is 1.282, suggesting that for the Championship game, the seed number plays a role again. This could be happening because historically, the higher seed wins more championship games.
+
+## Part 3: Simulate and Score Brackets
+
+Now let's generate brackets and see how they score against a real tournament. The code below generates 500 brackets using two strategies and scores them against the 2024 tournament results:
+
+-   **Pick Favorite:** Always pick the lower seed. No randomness.
+-   **Power Model (R64):** Simulate every game using the power model probabilities.
+
+```{r simulate}
+prob_mat <- build_power_prob_matrix(power_mod)
+actual <- precompute_actual(games, 2024)
+
+set.seed(345)
+
+pf_scores <- replicate(500, score_bracket_fast(gen_PF(), actual))
+r64_scores <- replicate(500, score_bracket_fast(gen_R64(prob_mat), actual))
+
+results <- tibble(
+  score = c(pf_scores, r64_scores),
+  method = rep(c("Pick Favorite", "Power Model"), each = 500)
+)
+```
+
+**Q4.** Compare the two methods using any visualizations/summary statistics you see fit. How do they compare? Is there an argument for using the power model?
+
+```{r q5}
+results %>%
+  group_by(method) %>%
+  summarise(
+    mean_score = mean(score),
+    median_score = median(score),
+    sd_score = sd(score),
+    max_score = max(score),
+    min_score = min(score)
+  )
+ggplot(results, aes(x = score, fill = method)) +
+  geom_histogram(alpha = 0.5, bins = 30, position = "identity") +
+  labs(title = "Score Distribution: Pick Favorite vs Power Model",
+       x = "Bracket Score", y = "Count", fill = "Method")
+```
+
+*Your answer:*
+
+Pick Favorite scores 1370 every single time with zero variance, as expected, since it always makes the same deterministic picks. The Power Model averages lower (1140 mean), but its scores range from 540 to 1640. We might choose the Power Model since the maximum 1640 beats the Pick Favorite by 270 points. This means that if we submit enough Power Model brackets, there might be one that could hit a high score and win the pool.
+
+## Part 4: Tweak the Model
+
+The power model's α values control upset frequency. What if you think the model is **too conservative** (doesn't predict enough upsets) or **too aggressive**?
+
+The code below lets you scale all the α values by a multiplier:
+
+-   `scale = 1.0` → original power model (no change)
+-   `scale = 0.5` → halve all alphas (more upsets, more randomness)
+-   `scale = 1.5` → increase all alphas (fewer upsets, closer to pick favorite)
+-   `scale = 0.0` → every game is a coin flip
+
+**Q5.** Pick **two** different scale values and generate 500 brackets with each. Fill in your chosen values below and run the code.
+
+```{r q7}
+scale_a <- 0.5
+scale_b <- 1.5
+
+scale_model <- function(model, s) {
+  mod <- model
+  mod$r1_alphas$alpha <- mod$r1_alphas$alpha * s
+  mod$round_alphas$alpha_bar <- mod$round_alphas$alpha_bar * s
+  mod
+}
+
+mat_a <- build_power_prob_matrix(scale_model(power_mod, scale_a))
+mat_b <- build_power_prob_matrix(scale_model(power_mod, scale_b))
+
+scores_a <- replicate(500, score_bracket_fast(gen_R64(mat_a), actual))
+scores_b <- replicate(500, score_bracket_fast(gen_R64(mat_b), actual))
+
+comparison <- tibble(
+  score = c(pf_scores, r64_scores, scores_a, scores_b),
+  method = rep(c("Pick Favorite", "Power (original)",
+                 paste0("Scaled (", scale_a, ")"),
+                 paste0("Scaled (", scale_b, ")")), each = 500)
+)
+
+comparison %>%
+  group_by(method) %>%
+  summarise(mean = mean(score), max = max(score), sd = sd(score))
+```
+
+**Q6.** Compare the four models you just looked at using any visualizations or summary statistics you see fit. Which alpha value performed the best? Why do you think this is?
+
+```{r q8}
+ggplot(comparison, aes(x = score, fill = method)) +
+  geom_histogram(alpha = 0.5, bins = 30, position = "identity") +
+  labs(title = "Score Distribution: All Four Methods",
+       x = "Bracket Score", y = "Count", fill = "Method")
+```
+
+*Your answer:*
+
+I created visualization comparing the four models. I think the alpha value of 1.5 performed the best, because it has the highest max score, a higher overall mean. This might be because alpha = 1.5 makes the model favor higher seeds more strongly, and usually the higher seeds win; but it still introduces a little bit of randomness.
+
+## Part 5: Comparing Generators
+
+So far we've only used the **R64 generator**, which simulates every game starting from Round 1. But the paper proposes other strategies that "anchor" at later rounds. They first sample which seeds reach the Final Four or Elite Eight using historical distributions, then fill in the rest.
+
+The intuition: if your model gets an early upset wrong, that error cascades through the whole bracket. Anchoring at a later round sidesteps that problem.
+
+Run the code below to compare three generators using the same power model probabilities:
+
+-   **R64:** Simulate all 63 games from Round 1
+-   **F4A:** Sample 4 Final Four seeds from a historical distribution, then simulate the last 3 games
+-   **E8:** Sample 8 Elite Eight seeds, then simulate from there
+
+```{r generators}
+sp <- compute_sampling_params(games, setdiff(1985:2023, 2020))
+
+set.seed(345)
+gen_results <- bind_rows(
+  evaluate_gen(function() gen_R64(prob_mat), "R64", 500, 5, actual),
+  evaluate_gen(function() gen_F4A(prob_mat, sp$q_f4), "F4A (anchor F4)", 500, 5, actual),
+  evaluate_gen(function() gen_E8(prob_mat, sp$q_e8), "E8 (anchor E8)", 500, 5, actual),
+  evaluate_gen(function() gen_PF(), "Pick Favorite", 500, 5, actual)
+)
+```
+
+**Q7.** Compare the max scores and mean scores across generators. Which generator produced the single highest-scoring bracket? Which had the highest average?
+
+```{r q9}
+gen_results %>% select(generator, max_score_mean, max_score_sd, mean_score)
+```
+
+*Your answer:*
+
+The anchor F4 produced the single highest-scoring bracket, while the Pick Favorite still has the highest average. Pick Favorite wins on average because it's deterministic, but its ceiling is capped at 1370.
+
+**Q8.** Now combine Parts 4 and 5. Take your best alpha scaling value from Part 4 and pair it with the generator that performed best above. Does the combination do better than either change alone?
+
+```{r q11}
+f4_scores <- replicate(500, score_bracket_fast(gen_F4A(prob_mat, sp$q_f4), actual))
+
+best_scale <- 1.5
+best_mat <- build_power_prob_matrix(scale_model(power_mod, best_scale))
+combo_scores <- replicate(500, score_bracket_fast(gen_F4A(best_mat, sp$q_f4), actual))
+
+tibble(
+  method = c("F4A (anchor F4)", "Your best combo"),
+  mean = c(mean(f4_scores), mean(combo_scores)),
+  max = c(max(f4_scores), max(combo_scores)),
+  sd = c(sd(f4_scores), sd(combo_scores))
+)
+```
+
+*Your answer:*
+
+Yes, the combination does better than anchor F4. However, it does not do better than simply the alpha = 1.5, because layering alpha on top of the F4 anchor might conflict with either calculation. So in conclusion, the combo beats F4A alone (+50 mean), but the alpha scaling alone (scale 1.5 with R64) was actually the single most impactful change. Combining them gives a middle ground, not a supercharged result.
+
+**Q9.** In 1–2 sentences: the paper finds that no single generator is best every year. Why might that be the case? (Think about what kind of tournament each generator is best suited for.)
+
+*Your answer:*
+
+Each generator is implicitly built for a different type of tournament — R64 thrives when early upsets drive the final outcome, while F4A and E8 excel when the Final Four or Elite Eight happen to match historical seed patterns closely. Since the actual tournament randomly varies each year in how chaotic it is, no single generator can be consistently optimal across all years.
+
+**Q10.** The power model has two notable limitations. First, it reduces every team to its seed number. For example, a dominant 1-seed and a weak 1-seed get identical win probabilities. Second, it is entirely circular for Round 1: the model estimates alpha values from observed win rates, then uses those alphas to reconstruct probabilities that exactly match the original win rates. Basically, the model doesn't learn anything beyond what the raw frequencies already tell you.
+
+Given these limitations, what approach would you take instead? What information beyond seed number would you incorporate, and how might it help the model generalize rather than just memorize historical frequencies?
+
+*Your answer:*
+
+Instead of using seed number alone, I would incorporate team-level performance metrics like efficiency ratings and how a team performed in their conference tournament. These features capture the real difference between a dominant 1-seed l and a weak 1-seed, which the current model treats identically as you mentioned as a limitation.
+
+To avoid the circularity problem, I would train the model on these features using held-out years, so the model is forced to generalize from underlying team quality rather than just reproducing the historical win rates it was fit on.
