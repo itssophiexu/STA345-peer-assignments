@@ -1,0 +1,512 @@
+---
+title: "Propensity Score Matching: Do NBA Players Shoot Worse on Back-to-Back Nights?"
+author: "Sophie Xu"
+date: today
+format: pdf
+editor: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+```
+
+# Background: The Back-to-Back Problem
+
+In the NBA, teams sometimes play games on consecutive nights (called "back-to-backs").
+Fatigue from the first night may make players shoot worse on the second night.
+But is this true?
+And if so, how much worse?
+
+This is a **causal inference problem**.
+We want to know: Does playing on a back-to-back second night **cause** lower shooting percentages?
+
+## Why This Is Hard
+
+The problem: Teams often rest starters or star players during the 2nd back-to-back game due to injury/load management concerns.
+
+This creates a **confounding** effect: The players who appear in B2B games may be systematically different from those who don't; not just in overall skill, but in what *type* of player they are.
+For example, teams may rest a high-usage perimeter star who takes many three-pointers but keep a low-usage interior big man who mostly shoots two-pointers.
+This means the B2B and non-B2B groups could differ in two ways:
+
+-   **Efficiency**: How well players shoot (e.g., 2PT%, 3PT%, FT%)
+-   **Role / shot profile**: What types of shots players take (e.g., 2PT attempts per game, 3PT attempts per game)
+
+A simple comparison of FG% between B2B and non-B2B games would mix the fatigue effect with these player differences.
+
+**The solution:** Use propensity score matching to compare B2B players with non-B2B players who have similar shooting efficiency *and* similar shot profiles.
+Now any remaining difference is about fatigue, not player type.
+
+## A Note on Load Management in Our Data
+
+In our raw dataset, player characteristics are almost perfectly balanced between B2B and non-B2B games.
+This means load management --- where teams rest their best players on back-to-back nights --- is either not present or too subtle to detect.
+Without imbalance between groups, propensity score matching has nothing to correct and produces estimates nearly identical to the naive comparison.
+
+To demonstrate how PSM works when confounding *is* present, we **simulate** a load management effect by dropping 60% of above-median-skill players from B2B games.
+This mimics star players sitting out on the second night of a back-to-back, creating a gap between the groups that PSM can then adjust for.
+The confounding we analyze below is artificially introduced.
+
+**Questions to Answer:** 1.
+What research questions are we trying to answer?
+2.
+How does propensity score matching help us make causal claims?
+
+------------------------------------------------------------------------
+
+# Part 1: Understanding Propensity Scores
+
+## What Is a Propensity Score?
+
+A **propensity score** is the estimated probability that an observation receives the treatment (here, playing on a B2B second night) given its observed characteristics.
+As discussed in Section 5 of the reading, propensity scores are typically estimated using a **logistic regression** of the treatment indicator on the observed confounders.
+
+In our case, the confounders capture two dimensions of each player:
+
+**Efficiency** (how well they shoot):
+
+-   `season_fg2_pct` --- season-to-date 2-point shooting percentage
+-   `season_fg3_pct` --- season-to-date 3-point shooting percentage
+-   `season_ft_pct` --- season-to-date free throw percentage
+
+**Role / shot profile** (what types of shots they take):
+
+-   `fg2a_per_game` --- 2-point attempts per game
+-   `fg3a_per_game` --- 3-point attempts per game
+-   `fta_per_game` --- free throw attempts per game
+
+Together, these six variables distinguish a high-volume perimeter shooter from a low-usage interior big, even if both have the same overall FG%.
+The logistic regression collapses all six into a single score between 0 and 1 that we can match on.
+
+## Why This Helps
+
+**The Problem:** If load management causes certain types of players (e.g., efficient, high-usage guards) to sit out B2B games, then the B2B group will be enriched with different player types.
+A naive comparison confounds fatigue with player composition.
+
+**The Solution:** Estimate each observation's propensity score, then match B2B observations with non-B2B observations that have nearly the same score.
+After matching, the two groups have similar distributions of efficiency and shot profile, so any remaining FG% difference is attributable to the B2B fatigue effect.
+
+------------------------------------------------------------------------
+
+# Part 2: The Assignment
+
+## Data
+
+This dataset was built from play-by-play data for the **2016--17 NBA regular season**.
+Each row is one player-game observation with game-level shooting splits and season-to-date rolling averages computed from all prior games.
+
+```{r}
+#| label: load-data
+
+data <- read.csv("nba_b2b_data.csv", stringsAsFactors = FALSE)
+
+cat("Original dataset dimensions:", nrow(data), "rows,", ncol(data), "columns\n")
+cat("Date range:", min(data$game_date), "to", max(data$game_date), "\n\n")
+
+# --- Stabilization Filter ---
+# Season-to-date rolling averages are noisy in the first few games (e.g.,
+# 1/3 from three = 33% season 3PT%). We require each player to have at least
+# 25 prior games so the confounders reflect actual skill, not small-sample noise.
+
+data <- data %>%
+  group_by(player_id) %>%
+  mutate(game_num = row_number()) %>%
+  ungroup() %>%
+  filter(game_num > 25) %>%
+  select(-game_num)
+
+cat("After 25-game stabilization filter:", nrow(data), "rows\n")
+
+# --- Simulated Load Management Filter ---
+# The raw data has almost no skill imbalance between B2B and non-B2B groups,
+# so PSM has nothing to correct. We simulate load management by dropping 60%
+# of above-median-skill B2B observations. See the note above for details.
+
+set.seed(123)
+data <- data %>%
+  filter(!is.na(season_fg_pct), !is.na(season_fg2_pct),
+         !is.na(season_fg3_pct), !is.na(season_ft_pct))
+
+median_skill <- median(data$season_fg_pct)
+
+data <- bind_rows(
+  data %>% filter(is_b2b_second_night == 0),
+  data %>% filter(is_b2b_second_night == 1, season_fg_pct < median_skill),
+  data %>% filter(is_b2b_second_night == 1, season_fg_pct >= median_skill) %>%
+    sample_frac(0.4)
+)
+
+cat("After load-management filter:", nrow(data), "rows\n\n")
+
+head(data)
+
+cat("\nTreatment (is_b2b_second_night) distribution:\n")
+print(table(data$is_b2b_second_night))
+
+cat("\nOutcome (fg_pct) summary:\n")
+fg_summary <- summary(data$fg_pct)
+cat(sprintf("  Min: %.2f | 1st Qu: %.2f | Median: %.2f | Mean: %.2f | 3rd Qu: %.2f | Max: %.2f\n",
+            fg_summary[1], fg_summary[2], fg_summary[3], fg_summary[4], fg_summary[5], fg_summary[6]))
+```
+
+## Variables in the Dataset
+
+| Variable                         | Description                               | Role                        |
+|------------------------|-------------------------------|-----------------|
+| `fg_pct`                         | Field goal percentage in this game (0--1) | **Outcome**                 |
+| `is_b2b_second_night`            | 1 = second night of B2B, 0 = otherwise    | **Treatment**               |
+| `season_fg2_pct`                 | Season-to-date 2PT shooting %             | **Confounder (efficiency)** |
+| `season_fg3_pct`                 | Season-to-date 3PT shooting %             | **Confounder (efficiency)** |
+| `season_ft_pct`                  | Season-to-date FT shooting %              | **Confounder (efficiency)** |
+| `fg2a_per_game`                  | Season-to-date 2PT attempts per game      | **Confounder (role)**       |
+| `fg3a_per_game`                  | Season-to-date 3PT attempts per game      | **Confounder (role)**       |
+| `fta_per_game`                   | Season-to-date FT attempts per game       | **Confounder (role)**       |
+| `player_name`, `game_date`, etc. | Context and reference info                | Not used in analysis        |
+
+**Important:** All confounder columns are **season-to-date** rolling averages computed from games *prior* to the current one.
+This means we are only using information available *before* each game, which is correct for causal inference.
+We also filter out each player's first 25 games so these averages have time to stabilize.
+
+------------------------------------------------------------------------
+
+# Task 1: Calculate the Propensity Score
+
+First, let's see the naive difference: the problem we're trying to fix:
+
+```{r}
+#| label: task1-naive-comparison
+
+cat("NAIVE COMPARISON (No Matching)\n\n")
+
+# Compare outcome and confounders across treatment groups
+naive_comparison <- data %>%
+  group_by(is_b2b_second_night) %>%
+  summarize(
+    mean_fg_pct = round(mean(fg_pct, na.rm = TRUE), 3),
+    mean_fg2_pct = round(mean(season_fg2_pct, na.rm = TRUE), 3),
+    mean_fg3_pct = round(mean(season_fg3_pct, na.rm = TRUE), 3),
+    mean_fg2a = round(mean(fg2a_per_game, na.rm = TRUE), 3),
+    mean_fg3a = round(mean(fg3a_per_game, na.rm = TRUE), 3),
+    n = n(),
+    .groups = "drop"
+  )
+
+print(naive_comparison)
+
+cat("\nNaive difference in FG%:\n")
+diff <- naive_comparison$mean_fg_pct[2] - naive_comparison$mean_fg_pct[1]
+cat(sprintf("B2B: %.3f, Non-B2B: %.3f, Difference: %.3f\n",
+            naive_comparison$mean_fg_pct[2],
+            naive_comparison$mean_fg_pct[1],
+            diff))
+```
+
+**Questions to Answer:** 1.
+What's the naive difference in FG% between B2B and non-B2B games?
+Which group shoots worse?
+2.
+Do the efficiency confounders (2PT%, 3PT%) differ between groups?
+What about the role confounders (2PA/game, 3PA/game)?
+3.
+Could the FG% difference just be because different types of players are appearing in B2B vs non-B2B games?
+
+**Solutions**:
+
+1.  The naive difference in FG is 1.6% between B2B and non-B2B games. B2B players shoot worse.
+2.  Yes, the efficiency confounders differ between groups, with B2B players haveing a lower season 2PT% (0.477 vs. 0.493, a 1.6-point gap) but a slightly higher season 3PT% (0.328 vs. 0.319). On net the B2B group is less efficient on the higher-volume shot type. For the role, B2B players take fewer 2-point attempts per game (5.45 vs. 6.06). This is consistent with high-usage scorers being rested on the second night.
+3.  Yes, the FG% difference could just be because different types of players are appearing in B2B vs non-B2B games. Because B2B players have a lower 2PT%, we cannot tell whether the 1.6 point FG% gap is real tiredness or just simply that less efficient players play in B2B games.
+
+Now estimate the propensity score using logistic regression.
+As described in Section 5 of the reading, the propensity score is the predicted probability of receiving the treatment given the observed confounders:
+
+```{r}
+#| label: task1-propensity-score
+
+# Fit a logistic regression: P(B2B = 1 | confounders)
+ps_model <- glm(
+  is_b2b_second_night ~ season_fg2_pct + season_fg3_pct + season_ft_pct +
+                         fg2a_per_game + fg3a_per_game + fta_per_game,
+  data = data,
+  family = binomial
+)
+
+cat("Logistic regression coefficients:\n")
+ps_summary <- summary(ps_model)
+ps_summary$coefficients <- round(ps_summary$coefficients, 4)
+print(ps_summary$coefficients)
+
+# Predicted probabilities = propensity scores
+data$propensity_score <- predict(ps_model, type = "response")
+
+cat("\nPropensity Score Summary:\n")
+ps_sum <- summary(data$propensity_score)
+cat(sprintf("  Min: %.2f | 1st Qu: %.2f | Median: %.2f | Mean: %.2f | 3rd Qu: %.2f | Max: %.2f\n",
+            ps_sum[1], ps_sum[2], ps_sum[3], ps_sum[4], ps_sum[5], ps_sum[6]))
+```
+
+**Questions to Answer:** 1.
+Which confounders have the largest logistic regression coefficients?
+2.
+What do the propensity scores represent?
+(Hint: they are predicted probabilities of what?) 3.
+Why is logistic regression a better approach than a simple weighted average when we have multiple confounders of different types (percentages vs per-game rates)?
+
+**Solutions**:
+
+1.  The season_fg2_pct has the largest coefficient (-4.1975).
+2.  The propensity scores are predicted probabilities of whether the observation falls in the B2B group.
+3.  Logistic regression here is a better approach than a simple weighted average when we have multiple confounders of different types, because it handles different scales automatically. For example, shooting percentage and attempts have very different units but the logistic regression coefficients adjust for these scales.
+
+------------------------------------------------------------------------
+
+# Task 2: Check Common Support and Balance
+
+Before matching, check that we have players in both treatment groups across the range of propensity scores (common support).
+
+```{r}
+#| label: task2-common-support
+
+# Visualize the distribution of propensity scores by treatment group
+data %>%
+  ggplot(aes(x = propensity_score, fill = factor(is_b2b_second_night))) +
+  geom_histogram(bins = 50, alpha = 0.7, position = "dodge") +
+  labs(
+    title = "Propensity Score Distribution by B2B Treatment Status",
+    x = "Propensity Score",
+    y = "Count",
+    fill = "B2B Second Night"
+  ) +
+  scale_fill_manual(
+    values = c("0" = "blue", "1" = "red"),
+    labels = c("0" = "Non-B2B", "1" = "B2B")
+  ) +
+  theme_minimal()
+
+# Check for common support
+cat("Propensity score range by treatment group:\n")
+cat("Control (non-B2B) range:",
+    round(min(data$propensity_score[data$is_b2b_second_night == 0]), 2), "to",
+    round(max(data$propensity_score[data$is_b2b_second_night == 0]), 2), "\n")
+cat("Treatment (B2B) range:",
+    round(min(data$propensity_score[data$is_b2b_second_night == 1]), 2), "to",
+    round(max(data$propensity_score[data$is_b2b_second_night == 1]), 2), "\n")
+```
+
+**Questions to Answer:** 1.
+Is there good overlap (common support) in the propensity score distributions?
+Describe what you see in the histogram.
+2.
+What propensity score ranges do B2B and non-B2B players have?
+Do they overlap?
+3.
+Are there regions where only one group appears?
+Why might this be problematic for matching?
+4.
+If common support is poor, what would that mean for our causal estimates?
+
+**Solutions**:
+
+1.  Yes, the common support looks strong in the propensity score distributions since they cover about the same range. The non-B2B distribution is much taller, though, but just because there are more observations.
+
+2.  Non-B2B range: 0.06-0.35
+
+    B2B range: 0.06- 0.33
+
+    These two ranges are almost the same, only differing 0.02 on the high end.
+
+3.  Yes, the only range where only one group appears is from 0.33-0.35, but here are very few observations there. This is problematic when we try to match the B2B with a non B2B game.
+
+4.  Poor common support would mean the estimate can only apply to a narrow slice of players, and we would have do drop the non-overlapping observations. However, fortunately, our visualization overlap looks good.
+
+------------------------------------------------------------------------
+
+# Task 3: Perform 1:1 Nearest Neighbor Matching
+
+For each B2B game, find the non-B2B game with the closest propensity score.
+Discard unmatched non-B2B games.
+
+```{r}
+#| label: task3-matching
+
+# Separate treatment and control groups
+treated <- data %>% filter(is_b2b_second_night == 1)
+control <- data %>% filter(is_b2b_second_night == 0)
+
+cat("Treatment group:", nrow(treated), "observations\n")
+cat("Control group:", nrow(control), "observations\n\n")
+
+# 1:1 nearest neighbor matching without replacement
+matched_data <- data.frame()
+
+for (i in 1:nrow(treated)) {
+  treated_ps <- treated$propensity_score[i]
+
+  # Find the closest control unit
+  diffs <- abs(control$propensity_score - treated_ps)
+  closest_idx <- which.min(diffs)
+  closest_match <- control[closest_idx, ]
+
+  # Add both treated and matched control to results
+  matched_data <- bind_rows(
+    matched_data,
+    treated[i, ] %>% mutate(matched_pair = i, matched = "Treated"),
+    closest_match %>% mutate(matched_pair = i, matched = "Control")
+  )
+
+  # Remove matched control to prevent reuse
+  control <- control[-closest_idx, ]
+}
+
+cat("Matched dataset created.\n")
+cat("Treated units:", sum(matched_data$matched == "Treated"), "\n")
+cat("Matched controls:", sum(matched_data$matched == "Control"), "\n")
+cat("Total matched observations:", nrow(matched_data), "\n")
+
+# Calculate sample loss
+original_n <- nrow(data)
+matched_n <- nrow(matched_data)
+pct_loss <- (1 - matched_n/original_n) * 100
+
+cat("\nSample size summary:\n")
+cat("Original dataset:", original_n, "observations\n")
+cat("Matched dataset:", matched_n, "observations\n")
+cat("Data lost:", original_n - matched_n, "observations (", round(pct_loss, 2), "%)\n")
+cat("\nNote: We discarded unmatched non-B2B games to create comparable pairs.\n")
+```
+
+**Questions to Answer:** 1.
+What percentage of the original data did we lose?
+2.
+Why did we remove unmatched non-B2B games instead of keeping them?
+3.
+In your own words, explain why matching creates more credible causal estimates even though we lose data.
+
+**Solutions**:
+
+1.  We lost 71.16% of the original data.
+2.  We removed the unmatched non-B2B games because they are observations that do not look like the B2B group, probably high skilled and efficient players, and keeping them would make the analysis imbalanced.
+3.  By dropping the unmatched games, we make sure that the leftover data's FG% gap is more likely caused by the game, not by the people on the court, and thus we reduce bias.
+
+------------------------------------------------------------------------
+
+# Task 4: Check Balance After Matching
+
+Did matching improve balance on the confounders?
+We check both efficiency and role variables.
+
+```{r}
+#| label: task4-check-balance
+
+confounders <- c("season_fg2_pct", "season_fg3_pct", "season_ft_pct",
+                 "fg2a_per_game", "fg3a_per_game", "fta_per_game")
+
+# Before matching
+before_data <- data %>%
+  group_by(is_b2b_second_night) %>%
+  summarize(across(all_of(confounders), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+# After matching
+after_data <- matched_data %>%
+  group_by(is_b2b_second_night) %>%
+  summarize(across(all_of(confounders), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+# Build balance table: difference between B2B and non-B2B, before and after
+balance_table <- tibble(
+  Variable = confounders,
+  Type = c("Efficiency", "Efficiency", "Efficiency", "Role", "Role", "Role"),
+  `Control vs Treatment Difference (Before Matching)` = round(as.numeric(before_data[2, confounders] - before_data[1, confounders]), 3),
+  `Control vs Treatment Difference (After Matching)` = round(as.numeric(after_data[2, confounders] - after_data[1, confounders]), 3)
+)
+
+cat("=== BALANCE: B2B minus Non-B2B, Before vs After Matching ===\n")
+print(balance_table)
+```
+
+**Questions to Answer:** 1.
+Compare the differences before vs. after matching.
+Did matching reduce the imbalance in both efficiency and role confounders?
+
+**Solution**:
+
+1.  Yes, matching actually dramatically reduced the imbalance in both efficiency and role confounders. Looking at the season_fg2_pct variable, the imbalance in efficiency dropped from -0.016 to -0.001; and the imbalance in role dropped from 0.612 to 0.050. Now this suggests that the GF% gap could be attributed to fatigue rather than the player identity more confidently.
+
+------------------------------------------------------------------------
+
+# Task 5: Estimate the Treatment Effect
+
+Compare shooting percentages in the matched dataset.
+
+```{r}
+#| label: task5-treatment-effect
+
+# Estimate the causal effect of B2B on FG% using the matched data
+model_matched <- lm(
+  fg_pct ~ is_b2b_second_night,
+  data = matched_data
+)
+
+cat("=== Treatment Effect (Matched Data) ===\n")
+matched_summary <- summary(model_matched)
+matched_summary$coefficients <- round(matched_summary$coefficients, 4)
+print(matched_summary)
+
+# Extract the treatment coefficient
+coef_b2b <- coef(model_matched)["is_b2b_second_night"]
+se_b2b <- sqrt(vcov(model_matched)["is_b2b_second_night", "is_b2b_second_night"])
+tstat <- coef_b2b / se_b2b
+pval <- 2 * (1 - pt(abs(tstat), df = nrow(matched_data) - 2))
+
+cat("\n=== INTERPRETATION ===\n")
+cat(sprintf("B2B Effect: %.4f (SE: %.4f, p = %.4f)\n", coef_b2b, se_b2b, pval))
+```
+
+**Questions to Answer:** 1.
+Interpret the effect in plain English: What does this coefficient (is_b2b_second_night) mean for an NBA player?
+2.
+Can you confidently say that B2B causes lower/higher shooting?
+What must hold for this to be a causal claim?
+
+**Solutions**:
+
+1.  The coefficient is_b2b_second_night is -0.0061, which means that after matching, B2B players shoot about 0.6% worse on the second night of playing compared to a non-B2B player.
+2.  We cannot confidently say that B2B causes lower shooting. Although we did account for matching and ruled out a lot of imbalances, the p-value of 0.392 is not significant enough for us to say that this is a causal claim.
+
+------------------------------------------------------------------------
+
+# Task 6: Compare to Naive Analysis
+
+```{r}
+#| label: task6-naive-analysis
+
+# Show the naive difference (no matching)
+naive_model <- lm(fg_pct ~ is_b2b_second_night, data = data)
+
+cat("=== Naive Analysis (No Matching) ===\n")
+naive_summary <- summary(naive_model)
+naive_summary$coefficients <- round(naive_summary$coefficients, 4)
+print(naive_summary)
+
+naive_coef <- coef(naive_model)["is_b2b_second_night"]
+
+cat("\n=== COMPARISON ===\n")
+cat(sprintf("Naive effect:    %.4f\n", naive_coef))
+cat(sprintf("Matched effect:  %.4f\n", coef_b2b))
+cat(sprintf("Difference:      %.4f\n", naive_coef - coef_b2b))
+```
+
+**Questions to Answer:** 1.
+What is the naive effect?
+How does it compare to the matched effect?
+2.
+Was propensity score matching necessary?
+What did it help us control for?
+
+**Solution**:
+
+1.  The naive effect is -0.0168 compared to the matched effect of -0.0061. The naive effect suggests that B2B games significantly reduced FG%, while the matched effect is not statistically significant and has a smaller FG%.
+2.  Yes, the propensity score matching was necessary. It helped us control for the player skills, such that we take the fact that B2B games might have more less-efficient players since better players were rested. Matching balanced 2-point attempts, 3-point attempts, and free throw attempts all together, so the matched groups take similar shots.
+
+------------------------------------------------------------------------
