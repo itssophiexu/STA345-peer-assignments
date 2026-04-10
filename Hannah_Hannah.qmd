@@ -1,6 +1,7 @@
 ---
 title: "Student Assignment: Who Wins at the US Open"
 subtitle: "Hannah and Hannah"
+format: pdf
 author: "Sophie Xu"
 ---
 
@@ -21,9 +22,7 @@ head(usopen) # look at first few rows
 colSums(is.na(usopen)) # count missing values per column
 ```
 
-**Report**: How many matches are in the dataset? Which columns have missing values? Looking
-at the column names, can you explain why W4, L4, W5, and L5 (set scores) are missing for
-most matches?
+**Report**: How many matches are in the dataset? Which columns have missing values? Looking at the column names, can you explain why W4, L4, W5, and L5 (set scores) are missing for most matches?
 
 **Solution**:
 
@@ -33,8 +32,7 @@ most matches?
 
 ### (b) Filter to completed matches
 
-Eight matches ended in retirement (one player withdrew mid-match). These have incomplete
-outcomes and should be removed before analysis.
+Eight matches ended in retirement (one player withdrew mid-match). These have incomplete outcomes and should be removed before analysis.
 
 ```{r}
 #| label: filter-completed
@@ -48,7 +46,7 @@ nrow(usopen) # how many matches remain?
 
 **Solution**:
 
-After filtering, 119 matches remain. I would expect the underdog to retire mid-match, probably because they are losing by a lot, and think they have no chance of coming back. The favorite might think they have a chance of comeback even if they are losing. Therefore, if we kept the retirement matches, we would have been counting them as winning instead of a possible upset, thus underestimate the true upset rate.
+After filtering, 119 matches remain. I would expect the underdog to retire mid-match, probably because they are losing by a lot, and think they have no chance of coming back. The favorite might think they have a chance of a comeback even if they are losing. Therefore, if we kept the retirement matches, we would have been counting them as winning instead of a possible upset, thus underestimating the true upset rate.
 
 ### (c) Define the favorite and compute implied probabilities
 
@@ -75,7 +73,7 @@ mean(usopen$outcome == "FavoriteWon") # what proportion did the favorite win?
 
 **Questions**: (i) What does it mean when total_prob \> 1? Why does this always happen with real bookmaker odds? (ii) What proportion of matches did the market favorite win? How does this compare to the \~65% figure reported in the paper for the full dataset? Can you think of a reason the US Open might differ?
 
-Solutions:
+**Solutions**:
 
 1.  When we convert bookmaker odds to probabilities with 1/odds, the implied probabilities always sum to more than one. This extra probabilty is how they make profit. This always happens because bookmakers set odds so that no matter who wins, they collect more money than they pay out.
 2.  Here, the favorite won 77.3% of the matches. This is higher than the 65% reported in the paper for the full dataset. This could be because this dataset is small, all from the US Open, and there aren't as many variations in possible upsets.
@@ -126,4 +124,68 @@ usopen %>%
 
 **Solution**:
 
-The 3rd round has the highest upset rate (32%), followed by the 1st round (26%). Surprisingly, the last three rounds have no upsets. This makes sense since the 3rd round is when the top seeds have beaten weaker opponents in the first two rounds, and are finally facing better-skilled, seeded opponents. The last three rounds are also when only the best players remain, when the skill difference between ranked #1 and #2 is big, and favorites dominate. However, we do have to note that we have a small sample size.
+The 3rd round has the highest upset rate (32%), followed by the 1st round (26%). Surprisingly, the last three rounds have no upsets. This makes sense since the 3rd round is when the top seeds have beaten weaker opponents in the first two rounds, and are finally facing better-skilled, seeded opponents with matching skill level. The last three rounds are when only the best players remain, when the skill difference between ranked #1 and #2 is big, and favorites dominate. However, we do have to note that we have a small sample size, and the upset rate should be low but probably not 0 if we had a bigger dataset.
+
+### (b) Market confidence vs. upset probability
+
+```{r}
+#| label: confidence
+#| message: false
+#| warning: false
+
+usopen %>%
+  mutate(upset_binary = as.numeric(outcome == "Upset")) %>%
+  ggplot(aes(x = fav_prob, y = upset_binary)) +
+  geom_jitter(alpha = 0.3, height = 0.05, width = 0) +
+  geom_smooth(method = "loess", se = TRUE) +
+  labs(title = "Market Confidence vs Upset Probability (2010 US Open)",
+    x = "Bookmaker-Implied Win Probability (Favorite)",
+    y = "Upset (1 = Yes, 0 = No)")
+```
+
+**Interpret**: What is the general relationship between the market’s confidence and whether an upset happens? Are there matches where the favorite had a very high implied probability but still lost? What does this suggest about the limits of bookmaker predictions?
+
+**Solution**:
+
+There is a negative relationship between the market's confidence and whether an upset happens. This makes sense, because as the win probability for the favorite increases, the likelihood of an upset decreases. However, there exist outliers, such as the point on the upper right corner with around 0.88 Bookmaker-implied win probability for the favorite, yet the underdog successfully upset. This suggests that even the bookmakers have limitations in their predictions, they are still probabilities and not certainties since tennis players' performances can vary by a lot.
+
+### (c) Log rank gap by outcome
+
+```{r}
+#| label: log-rank
+
+ggplot(usopen, aes(x = log_rank_gap, fill = outcome)) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Log Rank Gap: Upsets vs Favorite Wins (2010 US Open)",
+    x = "Log Rank Gap", y = "Density", fill = "Outcome")
+
+```
+
+**Interpret**: Are upsets more likely when the rank gap between players is small or large? Does this align with your intuition? Do you think rank gap adds useful information beyond what fav_prob already tells us, or are they capturing the same thing?
+
+**Solution**:
+
+Upsets are more likely when the log rank gap is small. In the visualization, the pink distribution is shifted left of the blue, suggesting that when the rank gap is smaller, the players are more evenly matched, so the underdog has a chance of winning. Rank gap does add useful information beyond what fav_prob already tells us: fav_prob comes from bookmaker odds, while rank gap is purely ranking-based, without any human interpretation.
+
+## Part 3: Statistical Background
+
+### (a) The bias-variance tradeoff
+
+A decision tree splits data by asking yes/no questions about features (e.g., “Is fav \_prob \> 0.80?”). At each split it picks the feature and threshold that best separate wins from upsets.
+
+**Question**: What is the risk of using a very deep tree (many splits) to predict match outcomes? What is the risk of a very shallow tree (only 1–2 splits)? This trade-off has a formal name in statistics — what is it, and which end of the spectrum does each extreme represent?
+
+**Solution**:
+
+This tradeoff is formally named the bias-variance tradeoff. This means that a deep tree with many splits has a low bias but high variance, possibly overfitting new data. A shallow tree, on the other hand, has high bias but low variance, making overly simple decisions. In our tennis prediction context, a deep try might memorize noise specific to our 119 matches and perform poorly on new data, while the shallow try might only look at the favorite probability and underfit the data.
+
+### (b) Why Random Forest beats a single tree
+
+A Random Forest builds many trees, each trained on a random bootstrap sample of the data and using a random subset of features at each split. The final prediction averages probabilities across all trees.
+
+**Questions**: (i) Why does averaging many trees reduce variance compared to relying on a single tree, even when each individual tree has high variance? (ii) With only 127 matches in our dataset, do you think a Random Forest would work well here, or might it struggle? What practical concern does the small sample size raise?
+
+**Solutions**:
+
+1.  Because each individual tree is trained on a different bootstrap sample, the average of all of the trees almost cancels out the underfitting and overfitting errors each tree makes, and the average converges toward the true probability. This works because the trees are uncorrelated to each other.
+2.  With only 127 matches in our dataset and 119 matches to work with, Random Forest will probably not work well here. Because we have so many feature columns and not enough rows, the random forest will probably overfit. What we did in Part 2, logistic regression, is a simple and better choice for this smaller dataset.
