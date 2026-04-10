@@ -1,0 +1,129 @@
+---
+title: "Student Assignment: Who Wins at the US Open"
+subtitle: "Hannah and Hannah"
+author: "Sophie Xu"
+---
+
+## Part 1: Data Cleaning and Setup
+
+### (a) Load and inspect the data
+
+Before any analysis, you need to understand what the data looks like and prepare it for modeling.
+
+```{r}
+#| label: load-data
+
+library(dplyr)
+library(ggplot2)
+usopen <- read.csv("data/usopen.csv")
+dim(usopen) # how many rows and columns?
+head(usopen) # look at first few rows
+colSums(is.na(usopen)) # count missing values per column
+```
+
+**Report**: How many matches are in the dataset? Which columns have missing values? Looking
+at the column names, can you explain why W4, L4, W5, and L5 (set scores) are missing for
+most matches?
+
+**Solution**:
+
+1.  There are 127 matches in the dataset.
+2.  W3, L3, W4, L4, W5, L5 have missing values.
+3.  W4 L4 suggests that the match ended in 3 sets, (3-0) and there isn't a 4th set, and W5 L5 missing suggests that the match ended in 4 sets (3-1).
+
+### (b) Filter to completed matches
+
+Eight matches ended in retirement (one player withdrew mid-match). These have incomplete
+outcomes and should be removed before analysis.
+
+```{r}
+#| label: filter-completed
+
+usopen <- usopen %>%
+ filter(Comment == "Completed")
+nrow(usopen) # how many matches remain?
+```
+
+**Question**: Why might including retired matches distort your analysis? Think about which player is more likely to retire mid-match — the favorite or the underdog — and what that could do to your upset rate estimate.
+
+**Solution**:
+
+After filtering, 119 matches remain. I would expect the underdog to retire mid-match, probably because they are losing by a lot, and think they have no chance of coming back. The favorite might think they have a chance of comeback even if they are losing. Therefore, if we kept the retirement matches, we would have been counting them as winning instead of a possible upset, thus underestimate the true upset rate.
+
+### (c) Define the favorite and compute implied probabilities
+
+Bookmaker odds include a built-in profit margin (the overround), so they cannot be read directly as probabilities. Use proportional normalization to convert them. The favorite is whoever has the lower (better) average odds.
+
+```{r}
+#| label: prob
+usopen <- usopen %>%
+ mutate(
+  prob_W_raw = 1 / AvgW,
+  prob_L_raw = 1 / AvgL,
+  total_prob = prob_W_raw + prob_L_raw,
+  prob_W = prob_W_raw / total_prob, # normalized implied prob(winner)
+  prob_L = prob_L_raw / total_prob, # normalized implied prob(loser)
+  fav_prob = pmax(prob_W, prob_L), # implied prob of the favorite
+  fav_is_winner = AvgW < AvgL, # TRUE if the market favorite won
+  outcome = factor(
+    ifelse(fav_is_winner, "FavoriteWon", "Upset"),
+    levels = c("Upset", "FavoriteWon")
+  )
+ )
+mean(usopen$outcome == "FavoriteWon") # what proportion did the favorite win?
+```
+
+**Questions**: (i) What does it mean when total_prob \> 1? Why does this always happen with real bookmaker odds? (ii) What proportion of matches did the market favorite win? How does this compare to the \~65% figure reported in the paper for the full dataset? Can you think of a reason the US Open might differ?
+
+Solutions:
+
+1.  When we convert bookmaker odds to probabilities with 1/odds, the implied probabilities always sum to more than one. This extra probabilty is how they make profit. This always happens because bookmakers set odds so that no matter who wins, they collect more money than they pay out.
+2.  Here, the favorite won 77.3% of the matches. This is higher than the 65% reported in the paper for the full dataset. This could be because this dataset is small, all from the US Open, and there aren't as many variations in possible upsets.
+
+### (d) Engineer features
+
+Create two additional features you will use in the EDA and math sections.
+
+```{r}
+#| label: additional-features
+usopen <- usopen %>%
+  mutate(
+ rank_gap = abs(WRank - LRank),
+ log_rank_gap = log1p(rank_gap),
+ Round = factor(Round, levels = c(
+  "1st Round", "2nd Round", "3rd Round",
+  "4th Round", "Quarterfinals", "Semifinals", "The Final"
+  ))
+ )
+```
+
+**Question**: Why does the paper use a log-scale for rank differences instead of the raw difference? Think about what it means for players ranked #1 and #10 to play versus players ranked #100 and #109 — are those differences equally meaningful?
+
+**Solution**:
+
+The paper uses a log-scale rank difference because ATP rankings are not linear. For example, the #1 player is probably dramatically better than #10; while the 100th and 109th player might have similar skill sets. Therefore, the raw rank gap of 9 means very different things. By scaling to the log, the larger gaps towards the end of the ranking table is not that extreme.
+
+## Part 2: Exploratory Data Analysis
+
+### (a) Upset rate by round
+
+```{r}
+#| label: p1
+
+usopen %>%
+ group_by(Round) %>%
+ summarise(upset_rate = mean(outcome == "Upset"), n = n()) %>%
+ ggplot(aes(x = Round, y = upset_rate)) +
+ geom_col(fill = "steelblue") +
+ geom_text(aes(label = paste0("n=", n)), vjust = -0.5, size = 3) +
+ labs(title = "Upset Rate by Round (2010 US Open)",
+   x = "Round", y = "Proportion of Upsets") +
+ theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+```
+
+**Interpret**: In which rounds do upsets occur most frequently? Think about how the composition of players changes as the tournament progresses — who is left by the Semifinals and Final? Does this help explain the pattern you see?
+
+**Solution**:
+
+The 3rd round has the highest upset rate (32%), followed by the 1st round (26%). Surprisingly, the last three rounds have no upsets. This makes sense since the 3rd round is when the top seeds have beaten weaker opponents in the first two rounds, and are finally facing better-skilled, seeded opponents. The last three rounds are also when only the best players remain, when the skill difference between ranked #1 and #2 is big, and favorites dominate. However, we do have to note that we have a small sample size.
