@@ -68,7 +68,7 @@ names(hockey)
 ## Variables in the Dataset
 
 | Variable                       | Description                                                  | Role                                     |
-|------------------------|------------------------|------------------------|
+|------------------|--------------------------------|----------------------|
 | `save`                         | 1 if the goalie made the save, 0 if goal allowed             | **Outcome**                              |
 | `recent_save_30`               | Recent rolling save rate over 30-shot window                 | **Recent-form predictor**                |
 | `recent_save_60`               | Recent rolling save rate over 60-shot window                 | **Recent-form predictor**                |
@@ -372,6 +372,13 @@ What does the random-intercept variance tell you substantively?
 4\.
 Which model appears to fit better based on AIC?
 
+**Solutions**:
+
+1.  No, the sign does not change for recent_save_120 after adding a drandom intercept for goalie. It actually gets more nagative and the p-value is more significant.
+2.  The mixed-effects model might be more appropriate because shots are nested within goalies – such that the observations for each goalie are not independent. This baseline for each different goalie attributes the skill difference between them.
+3.  The random-intercept variance is 0.04, suggesting that there is a difference between the baseline skill level of goalies, but they don't differ dramatically, as we saw from previous parts.
+4.  Looking at AIC, the random-intercept model fits better with an AIC of 4759 compared to 4765 from the fixed-effects model. This confirms that accounting for goalie-level differences improves the model.
+
 ------------------------------------------------------------------------
 
 # Part 6: Bayesian Logistic Regression with MCMC
@@ -482,6 +489,14 @@ How do the Bayesian and frequentist conclusions compare?
 5\.
 Why is the Bayesian model here still useful even though it uses fewer predictors than the full mixed-effects model?
 
+**Solutions**:
+
+1.   The posterior mean for recent_save_120 is -9.37.
+2.  The 90% posterior interval does not include 0, it is from \[-15.51, -3.34\], which is entirely negative. This suggests that we are 90% confident that the true coefficient is negative.
+3.  The probability that the coefficient is positive is 0.3%, while the probability that the coefficient is negative is 99.7%.
+4.  Both the Bayesian and frequentist conclusions suggest that the coefficient estimate is negative, with the Bayesian being (-9.37) and the Frequentist being (-9.54). Their magnitude and significance are similar, suggesting that the conclusion is pretty stable.
+5.  The Bayesian model here is still useful even though it uses fewer predictors, because the goal of Bayesian is to quantify the uncertainty around the hot-hand coefficient, not to build the most complete predictive model.
+
 ------------------------------------------------------------------------
 
 # Part 7: Final Write-Up
@@ -491,3 +506,9 @@ Write one to two sentences for each of the following questions:
 1.  Is there evidence of a goalie hot hand in this dataset?
 2.  How does controlling for shot quality and context affect the answer?
 3.  What are the main limitations of this analysis?
+
+**Solutions**:
+
+1.  Yes, there is evidence of a goalie hot hand in this dataset. This conclusion can be supported with statistically significant evidence from all three models, including the fixed-effects, mixed-effects and Bayesian. The coefficient on recent_save_120 is consistently negative, suggesting that higher recent save rates are associated with a lower probability of saving the next shot after controlling for performance.
+2.  By controlling for shot quality and context, we can isolate the effect of the goalie's personal skill. This can separate performance from simply facing easier shots, ensuring that the hot-hand coefficient is something real.
+3.  The main limitations of this analysis include the unmeasured factos, like goalie fatigue, injury status, or opponent quality that are equally important compared to shot angle. Without accounting for these variables, there could still be confounding variables that the models do not adress for.
