@@ -1,0 +1,493 @@
+---
+title: "Goalie Hot-Hand Assignment"
+author: "Sophie Xu"
+date: today
+format:
+  pdf:
+    toc: true
+    toc-depth: 2
+    code-fold: false
+editor: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(lme4)
+library(rstanarm)
+
+options(mc.cores = 1)
+```
+
+# Background: Is There a Goalie Hot Hand?
+
+In hockey, fans and commentators often argue that a goalie can get **hot** over a recent stretch of play.
+The idea is that a goalie who has performed well recently may be more likely to make the next save, even after accounting for shot quality and game context.
+
+This project asks whether recent goalie performance helps explain the probability of a save **after controlling for other factors that clearly affect shot outcomes**, such as angle, distance, rebounds, strength state, shot type, and game score state.
+
+Because our data are at the **shot level**, each row is one shot faced by a goalie.
+The response variable is binary:
+
+-   `save = 1` if the goalie made the save
+-   `save = 0` if the shot became a goal
+
+A simple comparison of save rates for “hot” versus “not hot” goalies would be misleading because shots differ in difficulty.
+For example, a rebound chance from close range is harder to stop than a routine outside shot.
+So instead of comparing raw averages, we will use **logistic regression**, **mixed-effects logistic regression**, and a **Bayesian logistic model**.
+
+## Questions We Want to Answer
+
+1.  Does recent goalie performance help predict whether the next shot is saved?
+2.  Does that relationship remain after controlling for shot characteristics and game context?
+3.  Does allowing for goalie-specific random intercepts change the conclusions?
+4.  What does a Bayesian version of the model tell us about uncertainty in the hot-hand effect?
+
+------------------------------------------------------------------------
+
+# Part 1: Data and Variables
+
+## Data
+
+This assignment uses the shot-level goalie dataset from 2021-22 and 2022-23.
+
+```{r}
+#| label: load-data
+
+hockey <- read.csv("data/goalie_hot_hand_data.csv", stringsAsFactors = FALSE)
+
+cat("Dataset dimensions:", nrow(hockey), "rows,", ncol(hockey), "columns\n")
+cat("Date range:", min(hockey$game_date), "to", max(hockey$game_date), "\n\n")
+
+names(hockey)
+```
+
+## Variables in the Dataset
+
+| Variable                       | Description                                                  | Role                                     |
+|------------------------|------------------------|------------------------|
+| `save`                         | 1 if the goalie made the save, 0 if goal allowed             | **Outcome**                              |
+| `recent_save_30`               | Recent rolling save rate over 30-shot window                 | **Recent-form predictor**                |
+| `recent_save_60`               | Recent rolling save rate over 60-shot window                 | **Recent-form predictor**                |
+| `recent_save_90`               | Recent rolling save rate over 90-shot window                 | **Recent-form predictor**                |
+| `recent_save_120`              | Recent rolling save rate over 120-shot window                | **Main recent-form predictor**           |
+| `recent_save_150`              | Recent rolling save rate over 150-shot window                | **Recent-form predictor**                |
+| `xprime_30`, ..., `xprime_150` | Expected save / shot-quality benchmark over matching windows | **Control for expected performance**     |
+| `angle`                        | Shot angle                                                   | **Shot-quality control**                 |
+| `distance`                     | Shot distance                                                | **Shot-quality control**                 |
+| `home`                         | Home / away indicator                                        | **Context control**                      |
+| `rebound`                      | Whether shot was a rebound                                   | **Context control**                      |
+| `strength`                     | Strength state                                               | **Context control**                      |
+| `shot_type`                    | Type of shot                                                 | **Context control**                      |
+| `game_score_state`             | Leading / tied / trailing                                    | **Context control**                      |
+| `goalie_name`                  | Goalie identity                                              | **Grouping variable for random effects** |
+
+## Cleaning the Data
+
+We will use the 120-shot rolling window as the main recent-performance measure in this assignment.
+
+```{r}
+#| label: clean-data
+
+hockey <- hockey %>%
+  mutate(
+    goalie_name = factor(goalie_name),
+    home = factor(home),
+    rebound = factor(rebound),
+    strength = factor(strength),
+    shot_type = factor(shot_type),
+    game_score_state = factor(game_score_state)
+  ) %>%
+  filter(
+    !is.na(save),
+    !is.na(recent_save_120),
+    !is.na(xprime_120),
+    !is.na(angle),
+    !is.na(distance),
+    !is.na(home),
+    !is.na(rebound),
+    !is.na(strength),
+    !is.na(shot_type),
+    !is.na(game_score_state),
+    !is.na(goalie_name)
+  )
+
+cat("Cleaned dataset dimensions:", nrow(hockey), "rows,", ncol(hockey), "columns\n")
+cat("Overall save rate:", round(mean(hockey$save), 4), "\n")
+```
+
+**Questions to Answer:**
+
+1\.
+Why is logistic regression appropriate for this response variable?
+
+2\.
+Why is it important that the rolling recent-save variables are based on prior shots rather than future shots?
+
+**Solutions:**
+
+1.  Logistic regression is appropriate for this response variable because "save" is binary. Logistic regression is perfect for predicting binary outcomes.
+2.  It is important that the rolling recent-save variables are based on prior shots rather than future shots to avoid data leakage. If we included future shots, the predictor would already know the outcome and that would invalidate the model.
+
+------------------------------------------------------------------------
+
+# Part 2: Exploratory Data Analysis
+
+Start by understanding the distribution of the main variables.
+
+```{r}
+#| label: eda-summary
+
+summary(
+  hockey %>%
+    select(save, recent_save_120, xprime_120, angle, distance)
+)
+```
+
+```{r}
+#| label: eda-histogram-recent-save
+
+hockey %>%
+  ggplot(aes(x = recent_save_120)) +
+  geom_histogram(bins = 40) +
+  labs(
+    title = "Distribution of recent_save_120",
+    x = "Recent save rate over prior 120 shots",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#| label: eda-histogram-xprime
+
+hockey %>%
+  ggplot(aes(x = xprime_120)) +
+  geom_histogram(bins = 40) +
+  labs(
+    title = "Distribution of xprime_120",
+    x = "Expected performance benchmark over prior 120 shots",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#| label: eda-save-rate-by-bin
+
+hockey %>%
+  mutate(recent_bin = ntile(recent_save_120, 4)) %>%
+  group_by(recent_bin) %>%
+  summarize(
+    mean_recent_save_120 = mean(recent_save_120, na.rm = TRUE),
+    observed_save_rate = mean(save, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+```
+
+**Questions to Answer:**
+
+1\.
+What does the distribution of `recent_save_120` look like?
+
+2\.
+Is there evidence in the grouped summary that higher recent save rates are associated with a higher probability of a save?
+
+**Solutions**:
+
+1.  The distribution of recent_save_120 is left-skewed, centered roughly around 0.92. Most goalies are clustered in that high range, which makes sense that professional goalies can save 90% of the shots. The spread is not large, which suggests that professional goalie performance is pretty consistent.
+2.  There is a positive relationship between the higher recent save rates and the higher probability of a save, yet it is not large. Bins 1 and 4 have a noticeable difference in save rate, while bins 2 and 3 are nearly identical.
+
+------------------------------------------------------------------------
+
+# Part 3: Fixed-Effects-Only Logistic Regression
+
+We first fit a standard logistic regression using shot-level controls and recent performance.
+
+```{r}
+#| label: model-fe
+
+model_fe <- glm(
+  save ~ recent_save_120 + xprime_120 + angle + distance + home + rebound +
+    strength + shot_type + game_score_state,
+  data = hockey,
+  family = binomial
+)
+
+cat("=== Fixed-Effects-Only Logistic Regression ===\n")
+fe_summary <- summary(model_fe)
+fe_summary$coefficients <- round(fe_summary$coefficients, 4)
+print(fe_summary$coefficients)
+```
+
+## Interpreting Logistic Coefficients
+
+Remember that logistic regression coefficients are on the **log-odds** scale.
+A positive coefficient means the predictor increases the log-odds of a save, while a negative coefficient decreases the log-odds of a save.
+
+To make the coefficients easier to interpret, compute odds ratios:
+
+```{r, message = F}
+#| label: odds-ratios-fe
+library(broom)
+library(dplyr)
+library(knitr)
+
+odds_table_fe <- tidy(model_fe) %>%
+  mutate(
+    odds_ratio = exp(estimate)
+  ) %>%
+  select(term, estimate, odds_ratio, std.error, statistic, p.value) %>%
+  mutate(
+    across(c(estimate, odds_ratio, std.error, statistic, p.value), ~ round(., 4))
+  )
+
+kable(
+  odds_table_fe,
+  caption = "Fixed-Effects Logistic Regression: Coefficients and Odds Ratios",
+  col.names = c("Term", "Log-Odds", "Odds Ratio", "Std. Error", "z value", "p-value")
+)
+```
+
+**Questions to Answer:**
+
+1\.
+What is the sign of the `recent_save_120` coefficient?
+What does that imply?
+
+2\.
+Why is it useful to include `xprime_120` along with `recent_save_120`?
+
+3\.
+Which controls appear most strongly associated with save probability?
+
+**Solutions:**
+
+1.  The sign of recent_save_120 is negative, suggesting that higher recent save rates actually decrease the probability of a save, which is quite surprising.
+2.  It is useful to include xprime_120 along with recent_save_120, because xprime is the expected save rate. Without xprime, a goalie who faced weak shots would look "hot" when they could have just been lucky. By including both, we're isolating true performance from simply easier shots.
+3.  If we look at the z and p values, the strongest controls are distance, game_score_stateTrailing, angle, and shot_type.
+
+------------------------------------------------------------------------
+
+# Part 4: Predicted Probabilities Using Unscaled Inputs
+
+Use the fixed-effects logistic regression to compare predicted save probability for a goalie at the 25th percentile and 75th percentile of `recent_save_120`, holding all other covariates fixed at typical values.
+
+```{r}
+#| label: prediction-section
+
+q25_recent <- quantile(hockey$recent_save_120, 0.25, na.rm = TRUE)
+q75_recent <- quantile(hockey$recent_save_120, 0.75, na.rm = TRUE)
+
+new_data <- tibble(
+  recent_save_120 = c(q25_recent, q75_recent),
+  xprime_120 = median(hockey$xprime_120, na.rm = TRUE),
+  angle = median(hockey$angle, na.rm = TRUE),
+  distance = median(hockey$distance, na.rm = TRUE),
+  home = factor(0, levels = levels(hockey$home)),
+  rebound = factor(0, levels = levels(hockey$rebound)),
+  strength = factor("-", levels = levels(hockey$strength)),
+  shot_type = factor("Backhand", levels = levels(hockey$shot_type)),
+  game_score_state = factor("Leading", levels = levels(hockey$game_score_state))
+)
+
+new_data <- new_data %>%
+  mutate(
+    predicted_prob = predict(model_fe, newdata = ., type = "response"),
+    predicted_prob_print = sprintf("%.6f", predicted_prob)
+  )
+
+new_data
+```
+
+**Questions to Answer:**
+
+1\.
+What are the predicted save probabilities at the 25th and 75th percentiles of `recent_save_120`?
+
+2\.
+How large is that difference in probability?
+
+3\.
+Why do we hold the other covariates fixed when doing this comparison?
+Why does this cause the predicted save probabilities to be extremely high?
+
+**Solutions**:
+
+1.  The predicted save probability at the 25th percentile is 97% and for the 75th percentile is 98%.
+2.  The difference is around 1%, which is pretty small, suggesting that even across the low and high ends of the percentiles, the hot-hand effect is still moderately small.
+3.  By holding all other covariates fixed, we can isolate the pure effect of recent_save_120 without confounding variables. This could cause the probabilities to be high, because the fixed values present an easy shot scenario, with a normal angle and distance, no rebounds, and leading game score.
+
+------------------------------------------------------------------------
+
+# Part 5: Random-Intercept Logistic Regression
+
+Shots are nested within goalies, and goalies likely differ in baseline save ability.
+A mixed-effects model lets each goalie have a different intercept.
+
+```{r}
+#| label: model-re
+
+model_re <- glmer(
+  save ~ recent_save_120 + xprime_120 + angle + distance + home + rebound +
+    strength + shot_type + game_score_state + (1 | goalie_name),
+  data = hockey,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5)),
+  nAGQ = 0
+)
+
+cat("=== Random-Intercept Logistic Regression ===\n")
+re_summary <- summary(model_re)
+re_summary$coefficients <- round(re_summary$coefficients, 4)
+print(re_summary$coefficients)
+```
+
+## Compare the Fixed and Random-Intercept Models
+
+```{r}
+#| label: compare-fe-re
+
+AIC(model_fe, model_re)
+
+cat("\nEstimated random-intercept variance for goalie_name:\n")
+print(VarCorr(model_re), comp = c("Variance", "Std.Dev."))
+```
+
+**Questions to Answer:**
+
+1\.
+Does the sign or significance of `recent_save_120` change after adding a random intercept for goalie?
+
+2\.
+Why might the mixed-effects model be more appropriate than the fixed-effects-only model here?
+
+3\.
+What does the random-intercept variance tell you substantively?
+
+4\.
+Which model appears to fit better based on AIC?
+
+------------------------------------------------------------------------
+
+# Part 6: Bayesian Logistic Regression with MCMC
+
+Now we fit a Bayesian logistic regression version of the model.
+Unlike ordinary logistic regression, Bayesian inference gives a **posterior distribution** for each coefficient rather than only a point estimate and standard error.
+
+We will use `rstanarm::stan_glm()` with a moderately sized MCMC run that should take around a minute or two on a typical laptop.
+
+## Why Bayesian?
+
+A Bayesian approach lets us answer questions like:
+
+-   What values of the hot-hand effect are most plausible given the data?
+-   How much posterior uncertainty remains around the coefficient on `recent_save_120`?
+-   Is most of the posterior mass above or below zero?
+
+To keep runtime reasonable, we will fit a slightly smaller model than the full logistic specification above while still keeping the key variables.
+Note: This will take about 2-3 minutes to run.
+
+```{r}
+#| label: bayes-model
+
+set.seed(123)
+
+model_bayes <- stan_glm(
+  save ~ recent_save_120 + xprime_120 + angle + distance + rebound +
+    shot_type + game_score_state,
+  data = hockey,
+  family = binomial(link = "logit"),
+  chains = 2,
+  iter = 1000,
+  warmup = 500,
+  seed = 123,
+  refresh = 100
+)
+
+print(model_bayes, digits = 3)
+```
+
+## Posterior Summary for the Hot-Hand Coefficient
+
+```{r}
+#| label: posterior-summary
+
+posterior_interval(model_bayes, prob = 0.90)
+```
+
+```{r}
+#| label: posterior-recent-save-only
+
+posterior_draws <- as.matrix(model_bayes)
+
+recent_draws <- posterior_draws[, "recent_save_120"]
+
+cat("Posterior mean for recent_save_120:", mean(recent_draws), "\n")
+cat("Posterior SD for recent_save_120:", sd(recent_draws), "\n")
+cat("Posterior probability coefficient > 0:", mean(recent_draws > 0), "\n")
+cat("Posterior probability coefficient < 0:", mean(recent_draws < 0), "\n")
+cat("90% posterior interval:\n")
+quantile(recent_draws, c(0.05, 0.95))
+```
+
+## Visualize the Posterior
+
+```{r}
+#| label: posterior-plot
+
+tibble(recent_draws = recent_draws) %>%
+  ggplot(aes(x = recent_draws)) +
+  geom_histogram(bins = 40) +
+  labs(
+    title = "Posterior Distribution for recent_save_120 Coefficient",
+    x = "Coefficient value",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+## Compare Bayesian and Frequentist Conclusions
+
+```{r}
+#| label: compare-bayes-fe
+
+cat("Frequentist estimate for recent_save_120:\n")
+coef(summary(model_fe))["recent_save_120", ]
+
+cat("\nBayesian posterior mean and 90% interval for recent_save_120:\n")
+cat("Posterior mean:", mean(recent_draws), "\n")
+quantile(recent_draws, c(0.05, 0.95))
+```
+
+**Questions to Answer:**
+
+1\.
+What is the posterior mean for `recent_save_120`?
+
+2\.
+Does the 90% posterior interval include zero?
+
+3\.
+What is the posterior probability that the coefficient is positive?
+Negative?
+
+4\.
+How do the Bayesian and frequentist conclusions compare?
+
+5\.
+Why is the Bayesian model here still useful even though it uses fewer predictors than the full mixed-effects model?
+
+------------------------------------------------------------------------
+
+# Part 7: Final Write-Up
+
+Write one to two sentences for each of the following questions:
+
+1.  Is there evidence of a goalie hot hand in this dataset?
+2.  How does controlling for shot quality and context affect the answer?
+3.  What are the main limitations of this analysis?
